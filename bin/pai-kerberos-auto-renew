@@ -1,0 +1,302 @@
+#!/bin/bash
+
+# 🧙‍♂️⚡ PAI Kerberos Auto-Renewal System
+# Eliminates manual kinit - provides seamless enterprise authentication
+
+set -euo pipefail
+
+# Configuration
+REALM="${KERBEROS_REALM:-IPA.REDHAT.COM}"
+PRINCIPAL="${KERBEROS_PRINCIPAL:-$USER@$REALM}"
+RENEW_THRESHOLD=3600  # Renew 1 hour before expiration
+LOG_FILE="/tmp/pai-kerberos-renewal.log"
+LOCK_FILE="/tmp/pai-kerberos-renewal.lock"
+
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+PURPLE='\033[0;35m'
+CYAN='\033[0;36m'
+WHITE='\033[1;37m'
+BOLD='\033[1m'
+NC='\033[0m' # No Color
+
+# Magical progress bar function
+show_magical_progress() {
+    local current=$1
+    local total=$2
+    local task=$3
+    local width=50
+    local percentage=$((current * 100 / total))
+    local completed=$((current * width / total))
+    
+    printf "${PURPLE}🔮 ${BOLD}${WHITE}Gandalf's Kerberos Magic:${NC} "
+    printf "${CYAN}[${NC}"
+    
+    # Create rainbow gradient in progress bar
+    for ((i=1; i<=completed; i++)); do
+        if ((i <= width/6)); then printf "${RED}█${NC}"
+        elif ((i <= width/3)); then printf "${YELLOW}█${NC}"
+        elif ((i <= width/2)); then printf "${GREEN}█${NC}"
+        elif ((i <= 2*width/3)); then printf "${CYAN}█${NC}"
+        elif ((i <= 5*width/6)); then printf "${BLUE}█${NC}"
+        else printf "${PURPLE}█${NC}"
+        fi
+    done
+    
+    printf "%$((width-completed))s" | tr ' ' '░'
+    printf "${CYAN}]${NC} ${BOLD}%3d%%${NC} ${PURPLE}⚡ %s${NC}\n" "$percentage" "$task"
+}
+
+# Logging function
+log_message() {
+    local level=$1
+    local message=$2
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [$level] $message" >> "$LOG_FILE"
+    
+    case $level in
+        "INFO") echo -e "${CYAN}ℹ️  $message${NC}" ;;
+        "SUCCESS") echo -e "${GREEN}✅ $message${NC}" ;;
+        "WARNING") echo -e "${YELLOW}⚠️  $message${NC}" ;;
+        "ERROR") echo -e "${RED}❌ $message${NC}" ;;
+        "MAGIC") echo -e "${PURPLE}🔮 $message${NC}" ;;
+    esac
+}
+
+# Check if another instance is running
+check_lock() {
+    if [ -f "$LOCK_FILE" ]; then
+        local pid=$(cat "$LOCK_FILE")
+        if ps -p "$pid" > /dev/null 2>&1; then
+            log_message "WARNING" "Another renewal process is running (PID: $pid)"
+            exit 1
+        else
+            log_message "INFO" "Removing stale lock file"
+            rm -f "$LOCK_FILE"
+        fi
+    fi
+    echo $$ > "$LOCK_FILE"
+    trap 'rm -f "$LOCK_FILE"; exit' INT TERM EXIT
+}
+
+# Get current ticket information
+get_ticket_info() {
+    local ticket_info
+    ticket_info=$(klist -s 2>/dev/null && klist 2>/dev/null | grep "krbtgt/$REALM@$REALM" | head -1)
+    
+    if [ -z "$ticket_info" ]; then
+        echo "0"
+        return
+    fi
+    
+    # Extract expiration time and convert to epoch
+    local exp_time=$(echo "$ticket_info" | awk '{print $3, $4}')
+    local exp_epoch
+    exp_epoch=$(date -d "$exp_time" +%s 2>/dev/null || echo "0")
+    echo "$exp_epoch"
+}
+
+# Check if ticket needs renewal
+needs_renewal() {
+    local exp_epoch=$1
+    local now_epoch=$(date +%s)
+    local time_left=$((exp_epoch - now_epoch))
+    
+    if [ "$exp_epoch" -eq 0 ]; then
+        log_message "INFO" "No valid ticket found - initial kinit required"
+        return 0
+    elif [ "$time_left" -le "$RENEW_THRESHOLD" ]; then
+        log_message "INFO" "Ticket expires in ${time_left}s - renewal needed"
+        return 0
+    else
+        log_message "INFO" "Ticket valid for ${time_left}s - no renewal needed"
+        return 1
+    fi
+}
+
+# Perform kinit
+do_kinit() {
+    log_message "MAGIC" "Attempting Kerberos authentication for $PRINCIPAL"
+    
+    show_magical_progress 1 4 "Authenticating with realm $REALM"
+    
+    # Try kinit with stored password if available
+    local credential_store="$HOME/.local/bin/pai-simple-credential-store"
+    if [ -x "$credential_store" ] && "$credential_store" --kinit >/dev/null 2>&1; then
+        show_magical_progress 4 4 "Authentication successful!"
+        log_message "SUCCESS" "Kerberos ticket obtained successfully"
+        return 0
+    fi
+    
+    # Try manual kinit (will prompt for password if needed)
+    if kinit "$PRINCIPAL" 2>/dev/null; then
+        show_magical_progress 4 4 "Authentication successful!"
+        log_message "SUCCESS" "Kerberos ticket obtained successfully"
+        return 0
+    else
+        log_message "ERROR" "Failed to obtain Kerberos ticket"
+        return 1
+    fi
+}
+
+# Renew existing ticket
+do_renewal() {
+    log_message "MAGIC" "Attempting ticket renewal for $PRINCIPAL"
+    
+    show_magical_progress 1 3 "Renewing Kerberos ticket"
+    
+    if kinit -R 2>/dev/null; then
+        show_magical_progress 3 3 "Ticket renewal successful!"
+        log_message "SUCCESS" "Kerberos ticket renewed successfully"
+        return 0
+    else
+        log_message "WARNING" "Ticket renewal failed - attempting fresh kinit"
+        show_magical_progress 2 3 "Renewal failed, getting new ticket"
+        return 1
+    fi
+}
+
+# Display current ticket status
+show_status() {
+    echo -e "${PURPLE}🧙‍♂️⚡ ${BOLD}${WHITE}Kerberos Authentication Status${NC}"
+    echo -e "${CYAN}═══════════════════════════════════${NC}"
+    
+    if klist -s 2>/dev/null; then
+        echo -e "${GREEN}✅ Active Kerberos Session${NC}"
+        klist | while read -r line; do
+            if [[ $line == *"Default principal:"* ]]; then
+                echo -e "${CYAN}👤 Principal:${NC} ${BOLD}$(echo $line | cut -d: -f2-)${NC}"
+            elif [[ $line == *"krbtgt/"* ]]; then
+                echo -e "${YELLOW}🎫 TGT Expires:${NC} ${BOLD}$(echo $line | awk '{print $3, $4}')${NC}"
+            fi
+        done
+    else
+        echo -e "${RED}❌ No Active Kerberos Session${NC}"
+        echo -e "${YELLOW}💡 Run: pai-kerberos-auto-renew --init${NC}"
+    fi
+    echo ""
+}
+
+# Install automatic renewal service
+install_service() {
+    log_message "MAGIC" "Installing automated Kerberos renewal service"
+    
+    # Create systemd user service
+    local service_dir="$HOME/.config/systemd/user"
+    mkdir -p "$service_dir"
+    
+    cat > "$service_dir/pai-kerberos-renewal.service" << EOF
+[Unit]
+Description=PAI Kerberos Ticket Auto-Renewal
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=$HOME/.local/bin/pai-kerberos-auto-renew --renew
+Environment=DISPLAY=:0
+
+[Install]
+WantedBy=default.target
+EOF
+
+    cat > "$service_dir/pai-kerberos-renewal.timer" << EOF
+[Unit]
+Description=PAI Kerberos Ticket Auto-Renewal Timer
+Requires=pai-kerberos-renewal.service
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=30min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+
+    # Enable and start the timer
+    systemctl --user daemon-reload
+    systemctl --user enable pai-kerberos-renewal.timer
+    systemctl --user start pai-kerberos-renewal.timer
+    
+    log_message "SUCCESS" "Automated renewal service installed and started"
+    log_message "INFO" "Service runs every 30 minutes and on boot"
+    
+    echo -e "${GREEN}🎯 Automated Kerberos renewal is now active!${NC}"
+    echo -e "${CYAN}📊 Check status: systemctl --user status pai-kerberos-renewal.timer${NC}"
+    echo -e "${CYAN}📋 View logs: journalctl --user -u pai-kerberos-renewal.service${NC}"
+}
+
+# Main function
+main() {
+    case "${1:-}" in
+        --init|--setup)
+            log_message "MAGIC" "Setting up automated Kerberos authentication"
+            check_lock
+            
+            # Initial authentication
+            if ! do_kinit; then
+                log_message "ERROR" "Initial setup failed - please check credentials"
+                exit 1
+            fi
+            
+            # Install service
+            install_service
+            
+            echo -e "\n${PURPLE}🧙‍♂️ ${BOLD}${WHITE}Setup Complete!${NC}"
+            echo -e "${GREEN}✅ Kerberos tickets will now auto-renew every 30 minutes${NC}"
+            echo -e "${GREEN}✅ No more manual kinit required!${NC}"
+            ;;
+            
+        --renew)
+            check_lock
+            local exp_epoch=$(get_ticket_info)
+            
+            if needs_renewal "$exp_epoch"; then
+                if ! do_renewal; then
+                    # Renewal failed, try fresh kinit (will fail if no password available)
+                    log_message "WARNING" "Automatic renewal not possible - manual intervention may be required"
+                    exit 1
+                fi
+            fi
+            ;;
+            
+        --status)
+            show_status
+            ;;
+            
+        --stop)
+            systemctl --user stop pai-kerberos-renewal.timer 2>/dev/null || true
+            systemctl --user disable pai-kerberos-renewal.timer 2>/dev/null || true
+            log_message "INFO" "Automated renewal service stopped"
+            echo -e "${YELLOW}⏹️  Automated renewal service stopped${NC}"
+            ;;
+            
+        --help|-h)
+            echo -e "${PURPLE}🧙‍♂️⚡ ${BOLD}${WHITE}PAI Kerberos Auto-Renewal System${NC}"
+            echo ""
+            echo -e "${CYAN}USAGE:${NC}"
+            echo -e "  pai-kerberos-auto-renew --init     ${GREEN}# Set up automated renewal${NC}"
+            echo -e "  pai-kerberos-auto-renew --status   ${GREEN}# Show current status${NC}"
+            echo -e "  pai-kerberos-auto-renew --renew    ${GREEN}# Manual renewal (used by service)${NC}"
+            echo -e "  pai-kerberos-auto-renew --stop     ${GREEN}# Stop automated renewal${NC}"
+            echo ""
+            echo -e "${PURPLE}🔮 FEATURES:${NC}"
+            echo -e "  • Automatic ticket renewal every 30 minutes"
+            echo -e "  • Seamless enterprise authentication"
+            echo -e "  • Integration with Red Hat corporate Kerberos"
+            echo -e "  • Magical progress indicators"
+            echo -e "  • Comprehensive logging and monitoring"
+            ;;
+            
+        *)
+            show_status
+            echo -e "${YELLOW}💡 Run with --help for usage options${NC}"
+            echo -e "${YELLOW}💡 Run with --init to set up automated renewal${NC}"
+            ;;
+    esac
+}
+
+# Run main function
+main "$@"

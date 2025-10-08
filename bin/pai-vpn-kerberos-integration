@@ -1,0 +1,349 @@
+#!/bin/bash
+
+# 🧙‍♂️⚡ PAI VPN-Triggered Kerberos Authentication
+# Automatically handles Kerberos authentication when connecting to Red Hat VPN
+
+set -euo pipefail
+
+# Configuration
+RED_HAT_VPN_NAME="Red Hat Global VPN"
+LOG_FILE="/tmp/pai-vpn-kerberos.log"
+KERBEROS_SCRIPT="$HOME/.local/bin/pai-kerberos-auto-renew"
+
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+PURPLE='\033[0;35m'
+CYAN='\033[0;36m'
+WHITE='\033[1;37m'
+BOLD='\033[1m'
+NC='\033[0m' # No Color
+
+# Logging function
+log_message() {
+    local level=$1
+    local message=$2
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [$level] VPN-Kerberos: $message" >> "$LOG_FILE"
+    
+    # Only show output if running interactively
+    if [ -t 1 ]; then
+        case $level in
+            "INFO") echo -e "${CYAN}ℹ️  $message${NC}" ;;
+            "SUCCESS") echo -e "${GREEN}✅ $message${NC}" ;;
+            "WARNING") echo -e "${YELLOW}⚠️  $message${NC}" ;;
+            "ERROR") echo -e "${RED}❌ $message${NC}" ;;
+            "MAGIC") echo -e "${PURPLE}🔮 $message${NC}" ;;
+        esac
+    fi
+}
+
+# Check if Red Hat VPN is connected
+is_redhat_vpn_connected() {
+    nmcli connection show --active | grep -q "$RED_HAT_VPN_NAME"
+}
+
+# Get current VPN connection name
+get_active_vpn() {
+    nmcli connection show --active | grep vpn | head -1 | awk '{print $1}' 2>/dev/null || echo ""
+}
+
+# Check if we're on Red Hat corporate network (VPN or direct)
+is_corporate_network() {
+    # Check if we can reach Red Hat Kerberos server
+    if timeout 3 nc -z kerberos.corp.redhat.com 88 2>/dev/null; then
+        return 0
+    fi
+    
+    # Alternative: Check if Red Hat VPN is connected
+    if is_redhat_vpn_connected; then
+        return 0
+    fi
+    
+    return 1
+}
+
+# Perform automatic Kerberos authentication
+do_automatic_auth() {
+    log_message "MAGIC" "Attempting automatic Kerberos authentication"
+    
+    # Check if kerberos script exists
+    if [ ! -x "$KERBEROS_SCRIPT" ]; then
+        log_message "ERROR" "PAI Kerberos auto-renewal script not found: $KERBEROS_SCRIPT"
+        return 1
+    fi
+    
+    # Try to renew existing ticket first
+    if "$KERBEROS_SCRIPT" --renew >/dev/null 2>&1; then
+        log_message "SUCCESS" "Kerberos ticket renewed automatically"
+        return 0
+    fi
+    
+    # If renewal fails, try automatic kinit with stored password
+    local credential_store="$HOME/.local/bin/pai-simple-credential-store"
+    if [ -x "$credential_store" ]; then
+        log_message "INFO" "Attempting automatic kinit with stored credentials"
+        if "$credential_store" --kinit >/dev/null 2>&1; then
+            log_message "SUCCESS" "Automatic kinit with stored password successful"
+            
+            # Send success notification
+            if command -v notify-send >/dev/null 2>&1 && [ -n "${DISPLAY:-}" ]; then
+                notify-send "🔐 Enterprise Authentication" "Kerberos authenticated automatically with stored credentials!" -t 3000 2>/dev/null || true
+            fi
+            return 0
+        else
+            log_message "WARNING" "Automatic kinit with stored password failed"
+        fi
+    fi
+    
+    # If all automatic methods fail, notify for manual intervention
+    log_message "INFO" "All automatic authentication methods failed - manual kinit may be required"
+    
+    # Send desktop notification if available
+    if command -v notify-send >/dev/null 2>&1 && [ -n "${DISPLAY:-}" ]; then
+        notify-send "🔮 Kerberos Authentication" "Red Hat VPN connected - automatic auth failed, run 'kinit' or store password with 'pai-credential-vault --store'" -t 8000 2>/dev/null || true
+    fi
+    
+    return 1
+}
+
+# Handle VPN connection event
+handle_vpn_connect() {
+    local vpn_name="$1"
+    
+    log_message "INFO" "VPN connected: $vpn_name"
+    
+    # Check if it's Red Hat VPN
+    if [[ "$vpn_name" == *"Red Hat"* ]] || [[ "$vpn_name" == *"Global VPN"* ]]; then
+        log_message "MAGIC" "Red Hat VPN detected - triggering Kerberos authentication"
+        
+        # Wait a moment for network to stabilize
+        sleep 2
+        
+        if do_automatic_auth; then
+            log_message "SUCCESS" "Automatic Kerberos authentication completed"
+            
+            # Send success notification
+            if command -v notify-send >/dev/null 2>&1 && [ -n "${DISPLAY:-}" ]; then
+                notify-send "🎯 Enterprise Authentication" "Kerberos ticket automatically renewed!" -t 3000 2>/dev/null || true
+            fi
+        else
+            # Send notification for manual action needed
+            if command -v notify-send >/dev/null 2>&1 && [ -n "${DISPLAY:-}" ]; then
+                notify-send "🔐 Authentication Required" "Please run 'kinit' to complete Red Hat authentication" -t 8000 2>/dev/null || true
+            fi
+        fi
+    else
+        log_message "INFO" "Non-Red Hat VPN connected - no Kerberos action needed"
+    fi
+}
+
+# Handle VPN disconnection event
+handle_vpn_disconnect() {
+    local vpn_name="$1"
+    
+    log_message "INFO" "VPN disconnected: $vpn_name"
+    
+    if [[ "$vpn_name" == *"Red Hat"* ]] || [[ "$vpn_name" == *"Global VPN"* ]]; then
+        log_message "INFO" "Red Hat VPN disconnected - Kerberos tickets remain valid"
+        
+        # Optionally could destroy tickets on disconnect, but that might be disruptive
+        # kdestroy -A 2>/dev/null || true
+        
+        # Send notification
+        if command -v notify-send >/dev/null 2>&1 && [ -n "${DISPLAY:-}" ]; then
+            notify-send "🌐 VPN Disconnected" "Red Hat VPN disconnected - Kerberos tickets still valid" -t 3000 2>/dev/null || true
+        fi
+    fi
+}
+
+# Monitor VPN connections
+monitor_vpn() {
+    log_message "INFO" "Starting VPN-Kerberos monitoring service"
+    
+    # Get initial state
+    local last_vpn=""
+    local current_vpn
+    
+    while true; do
+        current_vpn=$(get_active_vpn)
+        
+        # Check for VPN changes
+        if [ "$current_vpn" != "$last_vpn" ]; then
+            if [ -n "$current_vpn" ] && [ -z "$last_vpn" ]; then
+                # VPN connected
+                handle_vpn_connect "$current_vpn"
+            elif [ -z "$current_vpn" ] && [ -n "$last_vpn" ]; then
+                # VPN disconnected
+                handle_vpn_disconnect "$last_vpn"
+            elif [ -n "$current_vpn" ] && [ -n "$last_vpn" ]; then
+                # VPN changed
+                handle_vpn_disconnect "$last_vpn"
+                sleep 1
+                handle_vpn_connect "$current_vpn"
+            fi
+            last_vpn="$current_vpn"
+        fi
+        
+        # Check every 5 seconds
+        sleep 5
+    done
+}
+
+# Install NetworkManager dispatcher script
+install_dispatcher() {
+    log_message "MAGIC" "Installing NetworkManager VPN dispatcher integration"
+    
+    # Create dispatcher script
+    local dispatcher_script="/etc/NetworkManager/dispatcher.d/99-pai-vpn-kerberos"
+    
+    sudo tee "$dispatcher_script" > /dev/null << EOF
+#!/bin/bash
+# PAI VPN-Kerberos NetworkManager Dispatcher Script
+
+INTERFACE="\$1"
+ACTION="\$2"
+LOG_FILE="/tmp/pai-vpn-kerberos.log"
+
+log_nm_event() {
+    echo "[\$(date '+%Y-%m-%d %H:%M:%S')] [NM-DISPATCHER] Interface: \$INTERFACE, Action: \$ACTION" >> "\$LOG_FILE"
+}
+
+log_nm_event
+
+case "\$ACTION" in
+    "vpn-up")
+        # Get VPN connection name
+        VPN_NAME=\$(nmcli connection show --active | grep vpn | grep "\$INTERFACE" | awk '{print \$1}' 2>/dev/null || echo "Unknown VPN")
+        echo "[\$(date '+%Y-%m-%d %H:%M:%S')] [NM-DISPATCHER] VPN connected: \$VPN_NAME" >> "\$LOG_FILE"
+        
+        # Trigger Kerberos authentication for Red Hat VPN
+        if [[ "\$VPN_NAME" == *"Red Hat"* ]] || [[ "\$VPN_NAME" == *"Global VPN"* ]]; then
+            # Run as the user who owns the PAI script
+            sudo -u jbyrd bash -c "DISPLAY=:0 $HOME/.local/bin/pai-vpn-kerberos-integration --vpn-connect '\$VPN_NAME'" &
+        fi
+        ;;
+    "vpn-down")
+        # Get VPN connection name from environment or logs
+        VPN_NAME=\${VPN_IP4_DOMAINS:-"Unknown VPN"}
+        echo "[\$(date '+%Y-%m-%d %H:%M:%S')] [NM-DISPATCHER] VPN disconnected: \$VPN_NAME" >> "\$LOG_FILE"
+        ;;
+esac
+EOF
+
+    sudo chmod +x "$dispatcher_script"
+    log_message "SUCCESS" "NetworkManager dispatcher script installed"
+    
+    # Restart NetworkManager to pick up new dispatcher
+    log_message "INFO" "Restarting NetworkManager to activate dispatcher"
+    sudo systemctl restart NetworkManager
+    
+    log_message "SUCCESS" "VPN-triggered Kerberos authentication is now active!"
+}
+
+# Show current status
+show_status() {
+    echo -e "${PURPLE}🧙‍♂️⚡ ${BOLD}${WHITE}VPN-Kerberos Integration Status${NC}"
+    echo -e "${CYAN}═══════════════════════════════════════${NC}"
+    
+    # Check VPN status
+    local active_vpn=$(get_active_vpn)
+    if [ -n "$active_vpn" ]; then
+        echo -e "${GREEN}✅ VPN Connected:${NC} ${BOLD}$active_vpn${NC}"
+        
+        if is_redhat_vpn_connected; then
+            echo -e "${GREEN}🎯 Red Hat Corporate Network:${NC} ${BOLD}Connected${NC}"
+        else
+            echo -e "${YELLOW}🌐 External VPN:${NC} ${BOLD}Non-Red Hat VPN${NC}"
+        fi
+    else
+        echo -e "${RED}❌ No VPN Connected${NC}"
+    fi
+    
+    # Check Kerberos status
+    if klist -s 2>/dev/null; then
+        echo -e "${GREEN}✅ Kerberos Authentication:${NC} ${BOLD}Active${NC}"
+        local principal=$(klist | grep "Default principal" | cut -d: -f2- | xargs)
+        echo -e "${CYAN}👤 Principal:${NC} ${BOLD}$principal${NC}"
+    else
+        echo -e "${RED}❌ Kerberos Authentication:${NC} ${BOLD}No active tickets${NC}"
+    fi
+    
+    # Check if dispatcher is installed
+    if [ -f "/etc/NetworkManager/dispatcher.d/99-pai-vpn-kerberos" ]; then
+        echo -e "${GREEN}✅ VPN Integration:${NC} ${BOLD}NetworkManager dispatcher active${NC}"
+    else
+        echo -e "${YELLOW}⚠️  VPN Integration:${NC} ${BOLD}Not installed${NC}"
+        echo -e "${CYAN}💡 Run: pai-vpn-kerberos-integration --install${NC}"
+    fi
+    
+    echo ""
+}
+
+# Main function
+main() {
+    case "${1:-}" in
+        --install)
+            log_message "MAGIC" "Installing VPN-triggered Kerberos authentication"
+            install_dispatcher
+            echo -e "\n${PURPLE}🎯 ${BOLD}${WHITE}VPN Integration Installed!${NC}"
+            echo -e "${GREEN}✅ Kerberos will auto-authenticate when Red Hat VPN connects${NC}"
+            echo -e "${GREEN}✅ Desktop notifications enabled${NC}"
+            echo -e "${CYAN}📊 Check status: pai-vpn-kerberos-integration --status${NC}"
+            ;;
+            
+        --vpn-connect)
+            # Called by NetworkManager dispatcher
+            local vpn_name="${2:-Unknown VPN}"
+            handle_vpn_connect "$vpn_name"
+            ;;
+            
+        --monitor)
+            log_message "INFO" "Starting interactive VPN monitoring"
+            echo -e "${CYAN}🔍 Monitoring VPN connections... (Ctrl+C to stop)${NC}"
+            monitor_vpn
+            ;;
+            
+        --status)
+            show_status
+            ;;
+            
+        --test-auth)
+            log_message "INFO" "Testing automatic authentication"
+            if is_corporate_network; then
+                echo -e "${GREEN}✅ Corporate network detected${NC}"
+                do_automatic_auth
+            else
+                echo -e "${YELLOW}⚠️  Not on corporate network${NC}"
+                echo -e "${CYAN}💡 Connect to Red Hat VPN to test${NC}"
+            fi
+            ;;
+            
+        --help|-h)
+            echo -e "${PURPLE}🧙‍♂️⚡ ${BOLD}${WHITE}PAI VPN-Kerberos Integration${NC}"
+            echo ""
+            echo -e "${CYAN}USAGE:${NC}"
+            echo -e "  pai-vpn-kerberos-integration --install     ${GREEN}# Install VPN integration${NC}"
+            echo -e "  pai-vpn-kerberos-integration --status      ${GREEN}# Show current status${NC}"
+            echo -e "  pai-vpn-kerberos-integration --test-auth   ${GREEN}# Test authentication${NC}"
+            echo -e "  pai-vpn-kerberos-integration --monitor     ${GREEN}# Interactive monitoring${NC}"
+            echo ""
+            echo -e "${PURPLE}🔮 FEATURES:${NC}"
+            echo -e "  • Automatic Kerberos authentication on Red Hat VPN connect"
+            echo -e "  • Desktop notifications for authentication events"
+            echo -e "  • NetworkManager integration for seamless operation"
+            echo -e "  • Smart detection of Red Hat corporate network"
+            echo -e "  • Integration with existing PAI Kerberos auto-renewal"
+            ;;
+            
+        *)
+            show_status
+            echo -e "${YELLOW}💡 Run with --help for usage options${NC}"
+            echo -e "${YELLOW}💡 Run with --install to set up VPN integration${NC}"
+            ;;
+    esac
+}
+
+# Run main function
+main "$@"

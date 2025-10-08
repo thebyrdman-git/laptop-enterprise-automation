@@ -1,0 +1,50 @@
+# 🧙‍♂️⚡ Enterprise Laptop Automation - Git Ignore
+
+# Security - Never commit credentials
+*.gpg
+*.enc
+*password*
+*credential*
+kerberos_*
+
+# Logs and temporary files
+*.log
+/tmp/
+.tmp/
+
+# User-specific configurations
+config/user-*
+.env
+.secrets
+
+# Operating system files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Editor files
+*~
+*.swp
+*.swo
+.vscode/
+.idea/
+*.sublime-*
+
+# Backup files
+*.bak
+*.backup
+*.orig
+
+# Test files
+test_*
+*_test
+testing/
+
+# Local development
+local/
+dev/
+debug/
