@@ -1,0 +1,10 @@
+{
+  "ticket_lifetime_hours": 24,
+  "renewal_threshold_percent": 75,
+  "max_renewal_attempts": 3,
+  "browser_session_optimization": true,
+  "vpn_integration": true,
+  "smart_renewal_enabled": true,
+  "notification_enabled": true,
+  "security_level": "balanced"
+}

@@ -1,0 +1,27 @@
+{
+  "chrome": {
+    "session_persistence": true,
+    "kerberos_delegation": true,
+    "negotiate_auth_schemes": [
+      "ntlm",
+      "negotiate"
+    ],
+    "auth_server_whitelist": [
+      "*.redhat.com",
+      "*.corp.redhat.com",
+      "*.fedoraproject.org"
+    ],
+    "trusted_kdc_list": [
+      "kerberos.corp.redhat.com"
+    ]
+  },
+  "firefox": {
+    "network.negotiate-auth.trusted-uris": "https://.redhat.com,https://.corp.redhat.com",
+    "network.negotiate-auth.delegation-uris": "https://.redhat.com,https://.corp.redhat.com",
+    "network.automatic-ntlm-auth.trusted-uris": "https://.redhat.com",
+    "signon.rememberSignons": true,
+    "security.tls.hello_downgrade_check": false
+  },
+  "optimization_enabled": true,
+  "session_timeout_extension": "24h"
+}
